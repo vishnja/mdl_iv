@@ -32,6 +32,7 @@ from tqdm import tqdm
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 import decimal
 import random
+import time
 import signal
 signal.signal(signal.SIGINT, signal.SIG_DFL) #quiet control + c
 
@@ -45,8 +46,37 @@ MAX_CONCURRENT_REQUESTS = 4  # cffi will make sure no more than this many curl w
 MAX_CONCURRENT_TASKS = 64  # while we could theoretically leave this unbound just relying on MAX_CONCURRENT_REQESTS there is little reason to spawn a million tasks at once
 
 # Retry/backoff defaults for handling HTTP 429 (Too Many Requests) and transient 5xx errors
-DEFAULT_MAX_RETRIES = 5
+DEFAULT_MAX_RETRIES = 10
 DEFAULT_BACKOFF_BASE = 0.5
+
+# Global rate limiting to handle 429 across concurrent tasks
+RATE_LIMIT_UNTIL: float = 0.0
+
+def _get_retry_params():
+    try:
+        max_retries = int(CLA.getCommandLineArg(CommandLineArg.MAX_RETRIES)) if CLA.getCommandLineArg(CommandLineArg.MAX_RETRIES) != "" else DEFAULT_MAX_RETRIES
+    except Exception:
+        max_retries = DEFAULT_MAX_RETRIES
+    try:
+        backoff_base = float(CLA.getCommandLineArg(CommandLineArg.BACKOFF_BASE)) if CLA.getCommandLineArg(CommandLineArg.BACKOFF_BASE) != "" else DEFAULT_BACKOFF_BASE
+    except Exception:
+        backoff_base = DEFAULT_BACKOFF_BASE
+    return max_retries, backoff_base
+
+async def _respect_global_ratelimit():
+    wait = RATE_LIMIT_UNTIL - time.monotonic()
+    if wait > 0:
+        await asyncio.sleep(wait)
+
+def _update_global_ratelimit(seconds: float | None):
+    global RATE_LIMIT_UNTIL
+    if seconds is None:
+        return
+    if seconds <= 0:
+        return
+    target = time.monotonic() + float(seconds)
+    # Use max to avoid shortening an existing wait
+    RATE_LIMIT_UNTIL = max(RATE_LIMIT_UNTIL, target)
 
 BASE_MATTERPORT_DOMAIN = "matterport.com"
 CHINA_MATTERPORT_DOMAIN = "matterportvr.cn"
@@ -231,16 +261,59 @@ async def downloadFileWithJSONPost(type, shouldExist, url, file, post_json_str, 
         return
 
     reqId = logUrlDownloadStart(type, file, url, descriptor, shouldExist, key_type=AccessKeyType.PrimaryKey)
-    try:
-        resp: requests.Response = await OUR_SESSION.request(url=url, method="POST", headers={"Content-Type": "application/json"}, data=bytes(post_json_str, "utf-8"))
-        resp.raise_for_status()
-        # req.add_header('Content-Length', len(body_bytes))
-        async with aiofiles.open(file, "wb") as the_file:
-            await the_file.write(resp.content)
-        logUrlDownloadFinish(type, file, url, descriptor, shouldExist, reqId)
-    except Exception as ex:
-        logUrlDownloadFinish(type, file, url, descriptor, shouldExist, reqId, ex)
-        raise Exception(f"Request error for url: {url} ({type}) that would output to: {file} of: {ex}") from ex #str(ex) only is really doing the message not the entire cert  but we want the general error msg
+    attempt = 0
+    max_retries, backoff_base = _get_retry_params()
+
+    while True:
+        try:
+            await _respect_global_ratelimit()
+            resp: requests.Response = await OUR_SESSION.request(url=url, method="POST", headers={"Content-Type": "application/json"}, data=bytes(post_json_str, "utf-8"))
+            status = getattr(resp, "status_code", None)
+            if status == 429:
+                retry_after = None
+                try:
+                    headers = getattr(resp, "headers", {}) or {}
+                    retry_after = headers.get("Retry-After")
+                except Exception:
+                    retry_after = None
+
+                if attempt < max_retries:
+                    if retry_after:
+                        try:
+                            wait_seconds = float(retry_after)
+                        except Exception:
+                            wait_seconds = backoff_base * (2 ** attempt)
+                    else:
+                        wait_seconds = backoff_base * (2 ** attempt) + random.random() * 0.1
+                    _update_global_ratelimit(wait_seconds)
+                    logUrlDownloadFinish(type, file, url, descriptor, shouldExist, reqId, f"HTTP 429 received, retrying after {wait_seconds:.2f}s (attempt {attempt+1}/{max_retries})", altUrlExists=False)
+                    await asyncio.sleep(wait_seconds)
+                    attempt += 1
+                    continue
+                else:
+                    err_msg = f"HTTP 429: Too Many Requests after {attempt} attempts"
+                    logUrlDownloadFinish(type, file, url, descriptor, shouldExist, reqId, err_msg)
+                    raise Exception(err_msg)
+
+            resp.raise_for_status()
+            async with aiofiles.open(file, "wb") as the_file:
+                await the_file.write(resp.content)
+            logUrlDownloadFinish(type, file, url, descriptor, shouldExist, reqId)
+            return
+        except Exception as ex:
+            # Do not retry 404
+            err_str = f"{ex}"
+            if "Error 404" in err_str or getattr(ex, "status_code", None) == 404:
+                logUrlDownloadFinish(type, file, url, descriptor, shouldExist, reqId, ex)
+                raise Exception(f"Request error for url: {url} ({type}) that would output to: {file} of: {ex}") from ex
+            if attempt < max_retries:
+                wait_seconds = backoff_base * (2 ** attempt) + random.random() * 0.1
+                logUrlDownloadFinish(type, file, url, descriptor, shouldExist, reqId, f"Transient error: {err_str}; retrying after {wait_seconds:.2f}s (attempt {attempt+1}/{max_retries})")
+                attempt += 1
+                await asyncio.sleep(wait_seconds)
+                continue
+            logUrlDownloadFinish(type, file, url, descriptor, shouldExist, reqId, ex)
+            raise Exception(f"Request error for url: {url} ({type}) that would output to: {file} of: {ex}") from ex
 
 
 async def GetTextOnlyRequest(type, shouldExist, url, post_data=None) -> str:
@@ -308,10 +381,11 @@ async def downloadFile(type, shouldExist, url, file, post_data=None, always_down
 
         attempt = 0
         last_err = None
-        max_retries = DEFAULT_MAX_RETRIES
+        max_retries, backoff_base = _get_retry_params()
 
         while True:
             try:
+                await _respect_global_ratelimit()
                 response = await OUR_SESSION.get(url)
                 # Prefer to examine numeric status if available
                 status = getattr(response, "status_code", None)
@@ -328,11 +402,12 @@ async def downloadFile(type, shouldExist, url, file, post_data=None, always_down
                     if attempt < max_retries:
                         if retry_after:
                             try:
-                                wait_seconds = int(float(retry_after))
+                                wait_seconds = float(retry_after)
                             except Exception:
-                                wait_seconds = DEFAULT_BACKOFF_BASE * (2 ** attempt)
+                                wait_seconds = backoff_base * (2 ** attempt)
                         else:
-                            wait_seconds = DEFAULT_BACKOFF_BASE * (2 ** attempt) + random.random() * 0.1
+                            wait_seconds = backoff_base * (2 ** attempt) + random.random() * 0.1
+                        _update_global_ratelimit(wait_seconds)
                         logUrlDownloadFinish(type, file, url, "", shouldExist, reqId, f"HTTP 429 received, retrying after {wait_seconds:.2f}s (attempt {attempt+1}/{max_retries})", altUrlExists=False)
                         await asyncio.sleep(wait_seconds)
                         attempt += 1
@@ -360,7 +435,7 @@ async def downloadFile(type, shouldExist, url, file, post_data=None, always_down
 
                 # If we still have retries left, backoff and retry for transient errors (429 handled above, also handle 5xx)
                 if attempt < max_retries:
-                    wait_seconds = DEFAULT_BACKOFF_BASE * (2 ** attempt) + random.random() * 0.1
+                    wait_seconds = backoff_base * (2 ** attempt) + random.random() * 0.1
                     logUrlDownloadFinish(type, file, url, "", shouldExist, reqId, f"Transient error: {err_str}; retrying after {wait_seconds:.2f}s (attempt {attempt+1}/{max_retries})")
                     attempt += 1
                     await asyncio.sleep(wait_seconds)
@@ -1653,7 +1728,7 @@ class KeyHandler:
         return url.replace(match.group(0), key_val)
 
 
-CommandLineArg = Enum("CommandLineArg", ["ADVANCED_DOWNLOAD", "PROXY", "VERIFY_SSL", "DEBUG", "CONSOLE_LOG", "TILDE", "BASE_FOLDER", "ALIAS", "DOWNLOAD", "MAIN_ASSET_DOWNLOAD", "MANUAL_HOST_REPLACEMENT", "ALWAYS_DOWNLOAD_GRAPH_REQS", "QUIET", "HELP", "ADV_HELP", "AUTO_SERVE", "FIND_URL_KEY", "FIND_URL_KEY_AND_DOWNLOAD", "REFRESH_KEY_FILES", "GENERATE_TILE_MESH_CROPS", "TITLE"])
+CommandLineArg = Enum("CommandLineArg", ["ADVANCED_DOWNLOAD", "PROXY", "VERIFY_SSL", "DEBUG", "CONSOLE_LOG", "TILDE", "BASE_FOLDER", "ALIAS", "DOWNLOAD", "MAIN_ASSET_DOWNLOAD", "MANUAL_HOST_REPLACEMENT", "ALWAYS_DOWNLOAD_GRAPH_REQS", "QUIET", "HELP", "ADV_HELP", "AUTO_SERVE", "FIND_URL_KEY", "FIND_URL_KEY_AND_DOWNLOAD", "REFRESH_KEY_FILES", "GENERATE_TILE_MESH_CROPS", "TITLE", "MAX_RETRIES", "BACKOFF_BASE"])
 ArgAppliesTo = Enum("ArgAppliesTo", ["DOWNLOAD", "SERVING", "BOTH"])
 
 
@@ -1786,6 +1861,9 @@ def main():
     CLA.addCommandLineArg(CommandLineArg.FIND_URL_KEY_AND_DOWNLOAD, "Like FIND_URL_KEY but saves a copy to the debug folder of the item", "", "https://my.matterport.com/api/player/models/EGxFGTFyC9N/test.file", hidden=True, allow_saved=False)
     CLA.addCommandLineArg(CommandLineArg.REFRESH_KEY_FILES, "There are about a half dozen files always downloaded as they may contain access keys we need, this prevents these from downloading", True, hidden=True, allow_saved=False)
     CLA.addCommandLineArg(CommandLineArg.GENERATE_TILE_MESH_CROPS, "Certain views like dollhouse require cropped versions of certain textures, this uses python to generate all those", True, hidden=False, allow_saved=True)
+
+    CLA.addCommandLineArg(CommandLineArg.MAX_RETRIES, "Max retries for transient errors and 429 responses", DEFAULT_MAX_RETRIES, "N", hidden=True, allow_saved=False)
+    CLA.addCommandLineArg(CommandLineArg.BACKOFF_BASE, "Base backoff seconds for retries", DEFAULT_BACKOFF_BASE, "seconds", hidden=True, allow_saved=False)
 
     CLA.addCommandLineArg(CommandLineArg.MANUAL_HOST_REPLACEMENT, "Use old style replacement of matterport URLs rather than the JS proxy, this likely only works if hosted on port 8080 after", False, hidden=True)
 
